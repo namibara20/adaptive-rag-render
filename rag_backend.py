@@ -11,7 +11,7 @@ import torch
 import faiss
 
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -42,6 +42,12 @@ RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 TOP_RETRIEVAL = 20
 TOP_RERANKED = 5
 GENERATION_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+DEPLOYMENT_MODE = os.environ.get("RAG_DEPLOYMENT_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+DEPLOYMENT_DENSE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEPLOYMENT_RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
+if DEPLOYMENT_MODE:
+    DENSE_MODEL = DEPLOYMENT_DENSE_MODEL
+    RERANKER_MODEL = DEPLOYMENT_RERANKER_MODEL
 DENSE_TOP = 100
 BM25_TOP = 100
 
@@ -203,18 +209,21 @@ def load_core_resources():
     global clf_tokenizer, clf_model, rr_tokenizer, rr_model, dense_model, _CORE_LOADED
     if _CORE_LOADED:
         return
-    for path, label in ((CLF_PATH, "classifier"), (RR_PATH, "reranker")):
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Trained {label} model not found: {path}")
     if not os.path.exists(AIML_CORPUS_PATH):
         raise FileNotFoundError(f"AI/ML research corpus not found: {AIML_CORPUS_PATH}")
 
-    clf_tokenizer = BertTokenizer.from_pretrained(CLF_PATH)
-    clf_model = BertForSequenceClassification.from_pretrained(CLF_PATH).to(DEVICE).eval()
-    rr_tokenizer = AutoTokenizer.from_pretrained(RR_PATH)
-    rr_model = AutoModelForSequenceClassification.from_pretrained(
-        RR_PATH, num_labels=1, ignore_mismatched_sizes=True
-    ).to(DEVICE).eval()
+    if DEPLOYMENT_MODE:
+        rr_model = CrossEncoder(RERANKER_MODEL, device=DEVICE)
+    else:
+        for path, label in ((CLF_PATH, "classifier"), (RR_PATH, "reranker")):
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Trained {label} model not found: {path}")
+        clf_tokenizer = BertTokenizer.from_pretrained(CLF_PATH)
+        clf_model = BertForSequenceClassification.from_pretrained(CLF_PATH).to(DEVICE).eval()
+        rr_tokenizer = AutoTokenizer.from_pretrained(RR_PATH)
+        rr_model = AutoModelForSequenceClassification.from_pretrained(
+            RR_PATH, num_labels=1, ignore_mismatched_sizes=True
+        ).to(DEVICE).eval()
     dense_model = SentenceTransformer(DENSE_MODEL, device=DEVICE)
 
     df = pd.read_csv(AIML_CORPUS_PATH)
@@ -266,13 +275,35 @@ def load_benchmark_resources(dataset_key):
 
 def predict_alpha(query):
     """
-    Use the trained BERT classifier from NB03.
+    Map a query to one of the three adaptive retrieval weights.
+
+    Research mode uses the trained BERT classifier. Deployment mode uses a
+    lightweight deterministic query-style heuristic instead.
 
     Class mapping is identical to the original pipeline:
       0 -> alpha 0.2 -> keyword
       1 -> alpha 0.5 -> mixed
       2 -> alpha 0.8 -> semantic
     """
+
+    if DEPLOYMENT_MODE:
+        # Transparent deterministic query-style heuristic for the free demo.
+        # This is intentionally not represented as the trained BERT model.
+        text = str(query).strip().lower()
+        tokens = re.findall(r"[a-z0-9]+", text)
+        semantic_cues = {
+            "how", "why", "explain", "compare", "relationship", "effect",
+            "impact", "approach", "methods", "method", "mechanism", "improve",
+            "reduce", "benefit", "difference", "describe", "what happens",
+        }
+        keyword_cues = {"define", "meaning", "list", "name", "when", "where"}
+        if any(cue in text for cue in semantic_cues) or len(tokens) >= 13:
+            pred = 2
+        elif any(cue in text for cue in keyword_cues) or len(tokens) <= 5:
+            pred = 0
+        else:
+            pred = 1
+        return ALPHA_MAP[pred], LABEL_MAP[pred]
 
     enc = clf_tokenizer(
         str(query),
@@ -539,6 +570,20 @@ def rerank(
         return []
 
     scores = []
+
+    if DEPLOYMENT_MODE:
+        pairs = [(str(query), str(item.get("text", ""))) for item in candidates]
+        scores = np.asarray(
+            rr_model.predict(pairs, batch_size=batch_size, show_progress_bar=False),
+            dtype=np.float32,
+        ).reshape(-1).tolist()
+        ranked = []
+        for item, score in zip(candidates, scores):
+            result = dict(item)
+            result["rerank_score"] = float(score)
+            ranked.append(result)
+        ranked.sort(key=lambda x: x["rerank_score"], reverse=True)
+        return ranked[:top_k]
 
     rr_model.eval()
 
@@ -1248,6 +1293,8 @@ def _citation_sources(item):
 
 
 def load_generation_model():
+    if DEPLOYMENT_MODE:
+        raise RuntimeError("Qwen generation is disabled in free Demo / Deployment Mode.")
     global generation_tokenizer, generation_model
     if generation_tokenizer is not None and generation_model is not None:
         return generation_tokenizer, generation_model
@@ -1260,6 +1307,10 @@ def load_generation_model():
 
 
 def generate_grounded_answer(query_text, reranked_results, max_results=5):
+    if DEPLOYMENT_MODE:
+        from deployment_generation import generate_grounded_answer as generate_local_qwen
+
+        return generate_local_qwen(query_text, reranked_results, max_results=max_results)
     selected = list(reranked_results or [])[:max(1, min(int(max_results), 5))]
     citations, blocks = [], []
     for i, item in enumerate(selected, 1):

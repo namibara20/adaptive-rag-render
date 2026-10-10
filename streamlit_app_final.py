@@ -11,6 +11,14 @@ import streamlit as st
 # ============================================================
 
 ROOT = Path(__file__).resolve().parent
+deployment_setting = os.environ.get("RAG_DEPLOYMENT_MODE")
+if deployment_setting is None:
+    try:
+        deployment_setting = st.secrets.get("RAG_DEPLOYMENT_MODE", "false")
+    except Exception:
+        deployment_setting = "false"
+os.environ["RAG_DEPLOYMENT_MODE"] = str(deployment_setting)
+DEPLOYMENT_MODE = str(deployment_setting).strip().lower() in {"1", "true", "yes", "on"}
 
 os.environ["RAG_DATA_ROOT"] = str(ROOT / "data" / "RAG_Project")
 os.environ["RAG_OUTPUT_DIR"] = str(ROOT / "outputs")
@@ -184,7 +192,7 @@ st.markdown(
 # REAL RESEARCH BACKEND
 # ============================================================
 
-@st.cache_resource(show_spinner="Loading trained models and the AI/ML research corpus...")
+@st.cache_resource(show_spinner="Loading deployment models and the AI/ML research corpus..." if DEPLOYMENT_MODE else "Loading trained models and the AI/ML research corpus...")
 def load_backend():
     import rag_backend
     rag_backend.load_core_resources()
@@ -197,6 +205,18 @@ try:
 except Exception as exc:
     rag_backend = None
     BACKEND_ERROR = exc
+
+if rag_backend is None:
+    if DEPLOYMENT_MODE:
+        st.error(
+            "Demo models or the AI/ML corpus are unavailable. "
+            f"{type(BACKEND_ERROR).__name__}: {BACKEND_ERROR}"
+        )
+    else:
+        st.error(
+            "The trained research backend could not be loaded. "
+            f"{type(BACKEND_ERROR).__name__}: {BACKEND_ERROR}"
+        )
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -249,7 +269,10 @@ def show_result(result):
         "α controls the hybrid balance: α = 0.2 favors BM25, "
         "0.5 balances both signals, and 0.8 favors dense retrieval."
     )
-    st.caption("Hybrid retrieval: BM25 + BGE-M3 → Cross-Encoder re-ranking")
+    if DEPLOYMENT_MODE:
+        st.caption("Hybrid retrieval: BM25 + all-MiniLM-L6-v2 (Demo) → MiniLM cross-encoder (Demo)")
+    else:
+        st.caption("Hybrid retrieval: BM25 + BGE-M3 → Trained cross-encoder re-ranking")
 
     counts = result.get("source_counts", {})
     count_cols = st.columns(4)
@@ -276,6 +299,8 @@ def show_result(result):
         with st.container(border=True):
             st.info(generation.get("answer") or "The model returned an empty answer.")
             st.caption(f"Local generation model: {generation.get('model', 'unknown')}")
+            if generation.get("generation_seconds") is not None:
+                st.caption(f"Local generation time: {generation['generation_seconds']} seconds")
             if generation.get("citations"):
                 st.markdown("**Sources / citations**")
                 for citation in generation["citations"]:
@@ -289,7 +314,10 @@ def show_result(result):
                         else:
                             st.caption(label)
     elif result.get("generation_error"):
-        st.warning(f"Grounded generation failed; retrieved evidence is still available. {result['generation_error']}")
+        st.warning(f"Local generation failed; retrieved evidence is still available. {result['generation_error']}")
+        fallback = result.get("generation_fallback") or {}
+        if fallback.get("answer"):
+            st.info(fallback["answer"])
 
     st.markdown("### Retrieved evidence")
 
@@ -333,7 +361,23 @@ with st.sidebar:
 
     st.markdown("### Research pipeline")
     st.markdown(
-        """
+        ("""
+        **Query classification**
+
+        Lightweight demo classifier
+
+        **Hybrid retrieval**
+
+        BM25 + all-MiniLM-L6-v2 (Demo)
+
+        **Adaptive fusion**
+
+        Query-dependent α
+
+        **Re-ranking**
+
+        cross-encoder/ms-marco-MiniLM-L6-v2 (Demo)
+        """ if DEPLOYMENT_MODE else """
         **Query classification**  
         Trained BERT classifier
 
@@ -346,7 +390,7 @@ with st.sidebar:
         **Re-ranking**  
         Trained cross-encoder
         """
-    )
+    ))
 
     st.divider()
 
@@ -374,20 +418,21 @@ with st.sidebar:
 # ============================================================
 
 st.markdown(
-    """
+    f"""
 <div class="hero">
+<div class="sub" style="font-weight:700;color:#9fd8ff;">{"Demo / Deployment Mode" if DEPLOYMENT_MODE else "Research Mode"}</div>
 <h1>Enhancing RAG Using Hybrid Retrieval and Re-Ranking Techniques for AI and ML Based Research</h1>
 </div>
 
 <div class="pipeline">
 <div class="stage">Query</div><div class="arrow">→</div>
-<div class="stage">BERT Classifier</div><div class="arrow">→</div>
+<div class="stage">{"Lightweight demo classifier" if DEPLOYMENT_MODE else "BERT Classifier"}</div><div class="arrow">→</div>
 <div class="stage">Adaptive α</div><div class="arrow">→</div>
-<div class="stage">Hybrid Retrieval: BM25 + BGE-M3</div><div class="arrow">→</div>
-<div class="stage">Cross-Encoder</div><div class="arrow">→</div>
+<div class="stage">{"Hybrid Retrieval: BM25 + all-MiniLM-L6-v2 (Demo)" if DEPLOYMENT_MODE else "Hybrid Retrieval: BM25 + BGE-M3"}</div><div class="arrow">→</div>
+<div class="stage">{"MiniLM Cross-Encoder (Demo)" if DEPLOYMENT_MODE else "Cross-Encoder"}</div><div class="arrow">→</div>
 <div class="stage">Top Evidence</div><div class="arrow">→</div>
-<div class="stage">Local Instruct LLM</div><div class="arrow">→</div>
-<div class="stage">Grounded Answer + Citations</div>
+<div class="stage">{"Local Qwen 0.5B generation (deployment-only)" if DEPLOYMENT_MODE else "Local Instruct LLM"}</div><div class="arrow">→</div>
+<div class="stage">{"Evidence + citations" if DEPLOYMENT_MODE else "Grounded Answer + Citations"}</div>
 </div>
 """,
     unsafe_allow_html=True,
@@ -432,7 +477,10 @@ and reranks evidence from the local corpus and selected external scholarly sourc
         use_openalex = st.checkbox("OpenAlex", value=True)
     with source_cols[2]:
         use_arxiv = st.checkbox("arXiv", value=True)
-    generate_answer = st.checkbox("Generate grounded answer", value=False)
+    if DEPLOYMENT_MODE:
+        generate_answer = st.checkbox("Generate answer with local Qwen", value=True)
+    else:
+        generate_answer = st.checkbox("Generate grounded answer", value=False)
 
     with st.container(border=True):
         query_text = st.text_area(
@@ -462,10 +510,10 @@ and reranks evidence from the local corpus and selected external scholarly sourc
         elif not (use_local or use_openalex or use_arxiv):
             st.warning("Select at least one research source.")
         elif rag_backend is None:
-            st.error(
-                "The trained research backend could not be loaded. "
-                "Check the terminal traceback before the demonstration."
-            )
+            if DEPLOYMENT_MODE:
+                st.error(f"The demo retrieval models or corpus could not be loaded: {type(BACKEND_ERROR).__name__}: {BACKEND_ERROR}")
+            else:
+                st.error(f"The trained research backend could not be loaded: {type(BACKEND_ERROR).__name__}: {BACKEND_ERROR}")
         else:
             with st.spinner("Searching selected sources and reranking research evidence..."):
                 try:
@@ -477,7 +525,19 @@ and reranks evidence from the local corpus and selected external scholarly sourc
                         use_openalex,
                         use_arxiv,
                     )
-                    if generate_answer:
+                    if DEPLOYMENT_MODE and generate_answer:
+                        try:
+                            result["generation"] = rag_backend.generate_grounded_answer(
+                                query_text, result.get("results", []), max_results=3
+                            )
+                        except Exception as generation_exc:
+                            from deployment_generation import generation_unavailable_fallback
+
+                            result["generation_error"] = f"{type(generation_exc).__name__}: {generation_exc}"
+                            result["generation_fallback"] = generation_unavailable_fallback(
+                                result.get("results", []), generation_exc
+                            )
+                    elif generate_answer:
                         try:
                             result["generation"] = rag_backend.generate_grounded_answer(
                                 query_text, result.get("results", []), max_results=5
@@ -509,7 +569,10 @@ and reranks evidence from the local corpus and selected external scholarly sourc
 with tab_eval:
 
     st.markdown("## Evaluation results")
-    st.caption("Saved evaluation results from the completed research experiments.")
+    st.caption(
+        "Saved evaluation results from the completed research experiments."
+        + (" These are research-mode results, not measurements of the lightweight deployment models." if DEPLOYMENT_MODE else "")
+    )
 
     eval_path = ROOT / "outputs" / "all_results.json"
 

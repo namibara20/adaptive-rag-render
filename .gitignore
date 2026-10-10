@@ -2,7 +2,8 @@
 __pycache__/
 *.pyc
 
-data/
+data/*
+!data/chunks_aiml.csv
 outputs/
 
 .streamlit/
