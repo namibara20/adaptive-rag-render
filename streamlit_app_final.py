@@ -11,12 +11,32 @@ import streamlit as st
 # ============================================================
 
 ROOT = Path(__file__).resolve().parent
-deployment_setting = os.environ.get("RAG_DEPLOYMENT_MODE")
-if deployment_setting is None:
+
+
+def _resolve_deployment_setting():
+    """Honor explicit configuration, defaulting to deployment mode on Cloud."""
+    deployment_setting = os.environ.get("RAG_DEPLOYMENT_MODE")
+    if deployment_setting is not None:
+        return deployment_setting
+
     try:
-        deployment_setting = st.secrets.get("RAG_DEPLOYMENT_MODE", "false")
+        deployment_setting = st.secrets.get("RAG_DEPLOYMENT_MODE")
     except Exception:
-        deployment_setting = "false"
+        deployment_setting = None
+    if deployment_setting is not None:
+        return deployment_setting
+
+    # Community Cloud's mounted repository path is visible in its runtime
+    # paths (for example, /mount/src/<repository>). Keep local unset runs in
+    # research mode while making an unconfigured Cloud deployment use the
+    # lightweight models required by this repository.
+    cloud_source_root = Path("/mount/src")
+    if cloud_source_root.is_dir() and ROOT.is_relative_to(cloud_source_root):
+        return "true"
+    return "false"
+
+
+deployment_setting = _resolve_deployment_setting()
 os.environ["RAG_DEPLOYMENT_MODE"] = str(deployment_setting)
 DEPLOYMENT_MODE = str(deployment_setting).strip().lower() in {"1", "true", "yes", "on"}
 
